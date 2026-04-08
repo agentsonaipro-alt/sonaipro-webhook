@@ -1,5 +1,6 @@
 // webhook-handler.js
 // SonAiPro Registration → Supabase → Resend
+// Includes Kit polling every 5 minutes
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
@@ -23,11 +24,16 @@ const CONFIG = {
   SUPABASE_URL: process.env.SUPABASE_URL,
   SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY,
   RESEND_API_KEY: process.env.RESEND_API_KEY,
+  KIT_API_SECRET: process.env.KIT_API_SECRET,
   PORT: process.env.PORT || 3000
 };
 console.log('✅ Config loaded from .env');
 console.log('SUPABASE_URL:', CONFIG.SUPABASE_URL);
 console.log('RESEND_API_KEY exists:', !!CONFIG.RESEND_API_KEY);
+console.log('KIT_API_SECRET exists:', !!CONFIG.KIT_API_SECRET);
+ 
+// Track processed emails in memory to avoid duplicates
+const processedEmails = new Set();
  
 // ===== HELPER: Make HTTPS Requests =====
 function makeRequest(url, method, headers, body) {
@@ -85,7 +91,6 @@ async function storeSubscriber(email, firstName) {
   try {
     const response = await makeRequest(url, 'POST', headers, body);
     console.log('Supabase status:', response.status);
-    console.log('Supabase response:', JSON.stringify(response.data));
  
     if (response.status >= 200 && response.status < 300) {
       console.log('✅ Stored in Supabase:', email);
@@ -165,7 +170,6 @@ async function sendWelcomeEmail(email, firstName) {
  
   try {
     const response = await makeRequest(url, 'POST', headers, emailBody);
-    console.log('Resend status:', response.status);
     if (response.status >= 200 && response.status < 300) {
       console.log('✅ Welcome email sent:', email);
       return true;
@@ -179,7 +183,59 @@ async function sendWelcomeEmail(email, firstName) {
   }
 }
  
-// ===== WEBHOOK HANDLER =====
+// ===== PROCESS A SUBSCRIBER =====
+async function processSubscriber(email, firstName) {
+  if (processedEmails.has(email)) {
+    console.log(`⏭️  Already processed: ${email}`);
+    return;
+  }
+  processedEmails.add(email);
+ 
+  console.log(`\n🔄 Processing: ${email}`);
+  const stored = await storeSubscriber(email, firstName);
+  if (stored) {
+    await sendWelcomeEmail(email, firstName);
+    console.log(`✅ Done: ${email}\n`);
+  } else {
+    console.log(`⚠️  Skipping email for ${email} — Supabase insert failed\n`);
+  }
+}
+ 
+// ===== POLL KIT FOR NEW SUBSCRIBERS =====
+async function pollKitSubscribers() {
+  console.log(`\n🔍 Polling Kit for new subscribers...`);
+ 
+  // Get the 10 most recent subscribers — no date filter, use in-memory Set to avoid duplicates
+  const url = `https://api.convertkit.com/v3/subscribers?api_secret=${CONFIG.KIT_API_SECRET}&sort_order=desc&limit=10`;
+ 
+  try {
+    const response = await makeRequest(url, 'GET', { 'Content-Type': 'application/json' }, null);
+ 
+    if (response.status !== 200) {
+      console.error('❌ Kit API error:', response.status, JSON.stringify(response.data));
+      return;
+    }
+ 
+    const subscribers = response.data?.subscribers || [];
+ 
+    if (subscribers.length === 0) {
+      console.log('📭 No new subscribers found');
+      return;
+    }
+ 
+    console.log(`📬 Found ${subscribers.length} new subscriber(s)`);
+ 
+    for (const sub of subscribers) {
+      const email = sub.email_address;
+      const firstName = sub.first_name || 'there';
+      await processSubscriber(email, firstName);
+    }
+  } catch (error) {
+    console.error('❌ Kit polling error:', error.message);
+  }
+}
+ 
+// ===== WEBHOOK HANDLER (manual trigger fallback) =====
 async function handleWebhook(req, res) {
   console.log(`\n📨 Request received: ${req.method} ${req.url}`);
  
@@ -200,40 +256,23 @@ async function handleWebhook(req, res) {
   }
  
   let body = '';
- 
-  req.on('data', (chunk) => {
-    body += chunk.toString();
-  });
- 
+  req.on('data', (chunk) => { body += chunk.toString(); });
   req.on('end', async () => {
     try {
       const data = JSON.parse(body);
-      console.log('📥 Parsed data:', JSON.stringify(data, null, 2));
- 
       const email = data.email || data.subscriber?.email;
       const firstName = data.first_name || data.subscriber?.first_name || 'there';
  
       if (!email) {
-        console.log('❌ No email in request');
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'No email provided' }));
         return;
       }
  
-      console.log(`\n🔄 Processing signup: ${email}`);
+      await processSubscriber(email, firstName);
  
-      const stored = await storeSubscriber(email, firstName);
-      const sent = await sendWelcomeEmail(email, firstName);
- 
-      if (stored && sent) {
-        console.log(`✅ Successfully processed: ${email}\n`);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, message: 'Subscriber stored and welcome email sent', email: email }));
-      } else {
-        console.log(`⚠️  Partial failure for ${email} — stored: ${stored}, sent: ${sent}`);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Failed to process subscription', stored: stored, sent: sent }));
-      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, email: email }));
     } catch (error) {
       console.error('❌ Webhook error:', error);
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -249,11 +288,14 @@ server.listen(CONFIG.PORT, () => {
 ✅ SonAiPro Webhook Server Running
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Listening on: http://localhost:${CONFIG.PORT}
-Webhook endpoint: http://localhost:${CONFIG.PORT}
-Ready to receive Kit form submissions!
+Kit polling: every 5 minutes
 Supabase: ${CONFIG.SUPABASE_URL}
 Resend: Configured
   `);
+ 
+  // Run once on startup, then every 5 minutes
+  pollKitSubscribers();
+  setInterval(pollKitSubscribers, 5 * 60 * 1000);
 });
  
 process.on('SIGTERM', () => {
