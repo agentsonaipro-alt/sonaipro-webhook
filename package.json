@@ -1,5 +1,10 @@
 {
+  "name": "sonaipro-webhook",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node webhook-handler.js"
+  },
   "dependencies": {
-    "dotenv": "^17.4.1"
+    "dotenv": "^1.7.4.1"
   }
 }
