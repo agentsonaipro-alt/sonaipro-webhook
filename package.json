@@ -4,7 +4,4 @@
   "scripts": {
     "start": "node webhook-handler.js"
   },
-  "dependencies": {
-    "dotenv": "^1.7.4.1"
-  }
 }
